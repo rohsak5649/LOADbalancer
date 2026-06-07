@@ -1,0 +1,35 @@
+# Build stage
+FROM ubuntu:22.04 AS builder
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY . .
+
+RUN mkdir build && cd build && \
+    cmake -DCMAKE_BUILD_TYPE=Release .. && \
+    cmake --build .
+
+# Runtime stage
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=builder /app/build/LOADbalancer /app/LOADbalancer
+
+# Default environment variables
+ENV LB_PORT=5649
+ENV LB_ADMIN_PORT=5650
+ENV BACKEND_HOST=127.0.0.1
+ENV BACKEND_PORTS=8080,8081,8082,8083,8084
+ENV HEALTH_CHECK_INTERVAL=3
+
+EXPOSE 5649 5650
+
+ENTRYPOINT ["/app/LOADbalancer"]

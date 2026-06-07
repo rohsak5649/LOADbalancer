@@ -1,0 +1,142 @@
+================================================================================
+       CARD API SERVER — DOCKER & LOAD BALANCER REFERENCE MANUAL
+       Author  : Rohan Sakhare
+       Contact : rohanavinashsakhare@gmail.com | +91 9112765649
+       Version : 1.0
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 1 — WHY DO WE USE DOCKER & DOCKERFILES?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+In a standard setup, running C++ servers on a local machine comes with complex 
+problems:
+  1. Dependency Hell: You need MySQL Connector C++ and OpenSSL installed locally.
+  2. Database Limits: Starting 5 servers on your Mac opens 150 database connections
+     directly to your local MySQL, immediately hitting the limit and crashing 
+     the 4th and 5th servers.
+  3. Port Clashes: You have to manually assign and manage ports (8080, 8081, 8082, 
+     8083, 8084).
+  4. Platform Issues: If you build a binary on macOS, it won't run on Linux.
+
+Docker solves these problems by running each component in a lightweight, isolated 
+container. A "Dockerfile" is the blueprint for creating these containers.
+
+Here is how our Dockerfiles work:
+
+┌────────────────────────────────────────────────────────────────────────────┐
+│ 1. Dockerfile.backend                                                      │
+├────────────────────────────────────────────────────────────────────────────┤
+│ • Uses Multi-Stage Builds:                                                │
+│   - Stage 1 (Builder): Uses Ubuntu 22.04, installs build tools, strips out │
+│     macOS-specific paths, and compiles the CardAPIServer C++ binary.       │
+│   - Stage 2 (Runner): Copies only the final compiled binary and its        │
+│     required libraries (OpenSSL, MySQL Connector), creating a small,       │
+│     production-ready image without build tools.                           │
+│ • Configurable Port: Reads SERVER_PORT from environment variables at       │
+│   runtime to start on any port inside its isolated container network.      │
+└────────────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────────┐
+│ 2. Dockerfile.loadbalancer                                                 │
+├────────────────────────────────────────────────────────────────────────────┤
+│ • Compiles the Load Balancer code (Load.cpp) inside an Ubuntu environment.  │
+│ • Copies the binary and sets up default environment configurations.        │
+│ • Exposes the proxy port (5649) and admin monitoring port (5650).          │
+└────────────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────────┐
+│ 3. docker-compose.yml (The Orchestrator)                                   │
+├────────────────────────────────────────────────────────────────────────────┤
+│ • Spins up 7 containers automatically:                                     │
+│   - 1 MySQL container (mysql-db)                                           │
+│   - 5 Backend containers (card-backend-1 to card-backend-5)                │
+│   - 1 Load Balancer container (card-lb)                                    │
+│ • Links them in a private internal network ("card-network").               │
+│ • Ensures the database is healthy before the backends start, and that the   │
+│   backends are healthy before the load balancer starts!                    │
+└────────────────────────────────────────────────────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 2 — HOW THE C++20 LOAD BALANCER WORKS UNDER THE HOOD
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The Load Balancer consists of three core components running in parallel:
+
+                       ┌───────────────────────────────┐
+                       │      Incoming HTTP Traffic    │
+                       │           (Port 5649)         │
+                       └───────────────┬───────────────┘
+                                       │
+                                       ▼
+                       ┌───────────────────────────────┐
+                       │     Wildcard Proxy Handler    │
+                       │       (Method Matchers)       │
+                       └───────────────┬───────────────┘
+                                       │  1. Pick Backend
+                                       ▼
+                       ┌───────────────────────────────┐
+                       │  pick_backend() Algorithm    │
+                       │  - Alive: true                │
+                       │  - Active connections: min    │
+                       │  - Tie-breaker: Round-Robin   │
+                       └───────────────┬───────────────┘
+                                       │  2. Forward HTTP Req
+                                       ▼
+                       ┌───────────────────────────────┐
+                       │   Target Backend Container    │
+                       │     (8080, 8081, 8082...)     │
+                       └───────────────────────────────┘
+
+================================================================================
+1. THE LEAST-CONNECTIONS ROUTING ALGORITHM (pick_backend())
+================================================================================
+When a client sends a transaction request (like POST /transaction/initiate) to 
+port 5649, the load balancer runs the selection engine:
+  • It scans all registered backend servers.
+  • It ignores any backends that are currently marked as DEAD by the health check.
+  • Out of the remaining ALIVE backends, it identifies the one with the lowest 
+    number of `active_requests` currently running.
+  • If there is a tie (e.g., three backends have 0 active requests), it uses an 
+    atomic global index (`rr_index`) to select one using Round-Robin.
+  • If all 5 backends are down, it immediately returns a clean 503 error 
+    ("All backends are currently unavailable").
+
+================================================================================
+2. THE HTTP METHOD PROXY FORWARDING
+================================================================================
+Once a backend is chosen:
+  • The Load Balancer increments the backend's active requests counter (`active_requests++`).
+  • It copies all original request headers (except connection-sizing and Host).
+  • It passes the exact body (`req.body`) and parameters (`req.params`).
+  • It appends an tracking header `X-LB-Backend: <port>` so you can trace 
+    exactly which server handled the transaction.
+  • It forwards the request to the backend using a high-performance HTTP client.
+  • Once the backend responds, the load balancer decrements the counter 
+    (`active_requests--`), calculates the response latency (using steady_clock), 
+    and updates a rolling 10-sample exponential moving average (EMA) of latency.
+
+================================================================================
+3. THE BACKGROUND HEALTH MONITOR (health_checker_loop())
+================================================================================
+A separate background daemon thread runs continuously:
+  • Every 3 seconds, it sends a GET `/health` request to each backend container.
+  • It verifies if the response status is 200 OK and contains `"status": "UP"`.
+  • Flap Protection / Thresholds:
+    - If a healthy backend fails its health check **2 consecutive times**, it is 
+      marked DEAD and instantly removed from the routing pool.
+    - If a dead backend succeeds **2 consecutive times**, it is marked ALIVE and 
+      reattached to the routing pool.
+  • These state transitions are completed lock-free using atomic operators 
+    (`compare_exchange_strong`) to maximize multithreaded speed.
+
+================================================================================
+4. THE GRACEFUL SHUTDOWN SEQUENCE
+================================================================================
+When the Load Balancer receives a termination signal (SIGINT or SIGTERM):
+  • It stops accepting new traffic immediately.
+  • It waits for currently processing requests to finish.
+  • It cleanly terminates the background health checker daemon.
+  • It stops the admin monitoring server and terminates, preventing any half-open
+    connections or leaked sockets.
