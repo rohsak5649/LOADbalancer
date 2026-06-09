@@ -50,11 +50,16 @@ An industrial-grade, multithreaded **C++20 Reverse Proxy Load Balancer** specifi
                                      ▼
          ┌─────────────────────────────────────────────────────────┐
          │                                                         │
-         │          LOAD BALANCER CONTAINER (Port 5649)            │
+         │          LOAD BALANCER SERVICE (Port 5649)              │
          │                                                         │
          │   ┌─────────────────────────────────────────────────┐   │
          │   │          HEALTH MONITOR (Background)            │   │
          │   │   Pings /health on each backend periodically.   │   │
+         │   └─────────────────────────────────────────────────┘   │
+         │                                                         │
+         │   ┌─────────────────────────────────────────────────┐   │
+         │   │          LIFECYCLE MANAGER (Local Mode)         │   │
+         │   │   Starts 3 active, auto-failover & recycling.    │   │
          │   └─────────────────────────────────────────────────┘   │
          │                                                         │
          │   ┌─────────────────────────────────────────────────┐   │
@@ -89,7 +94,7 @@ Clients send transactions directly to the Load Balancer on port `5649`. The Load
 
 ## ⚙️ How It Works Under the Hood
 
-The load balancer manages backend nodes using three parallel asynchronous processes:
+The load balancer manages backend nodes using four parallel asynchronous processes:
 
 ### 1. Least-Connections Routing
 When an HTTP request hits the proxy:
@@ -113,12 +118,55 @@ A dedicated worker thread runs in the background at configurable intervals (defa
   * If a dead node passes the health check **2 consecutive times**, it is restored to the routing pool.
 * State alterations are written using atomic memory structures to prevent race conditions without acquiring heavy OS locks.
 
-### 4. Graceful Shutdown Sequence
+### 4. Local Container Lifecycle Manager & Failover Controller
+When running in local mode (not in Docker), the load balancer monitors the status of your backend containers:
+* **Initial Auto-Start**: It automatically boots the first 3 containers (ports `8080`, `8081`, `8082`) in separate macOS Terminal windows using AppleScript.
+* **Startup Timeout Detection**: If a started container fails to report healthy (`alive = true`) within 10 seconds (configurable via `STARTUP_TIMEOUT`), it is marked failed.
+* **Hot-Standby Failover**: If any active container crashes or gets marked `DEAD` by the health checker, the load balancer initiates a failover:
+  - It picks the first available standby container (ports `8083` then `8084`) and spawns it to keep exactly 3 containers active.
+* **Dynamic Recycling Strategy**: If all containers have run and failed, it automatically recycles the previously failed containers. It prioritizes the container that went down longest ago to maximize its cooldown window.
+
+```mermaid
+graph TD
+    Start([Load Balancer Starts]) --> CheckMode{Docker Mode?}
+    CheckMode -- Yes --> HealthChecksOnly[Health Checks Active Backends]
+    CheckMode -- No (Local) --> InitLaunch[Launch First 3 Containers: 8080, 8081, 8082]
+    
+    InitLaunch --> LoopStart[Every 3 Seconds Health Check]
+    
+    LoopStart --> CheckAlives[Verify Started & Active Backends]
+    CheckAlives --> DetectIssues{Is Backend Alive?}
+    
+    DetectIssues -- Yes --> MarkWasAlive[was_alive = true]
+    DetectIssues -- No --> CheckFailReason{Fail Reason?}
+    
+    CheckFailReason -- was_alive is true --> FailMark[Mark failed = true, Release Port]
+    CheckFailReason -- was_alive is false & Time > 10s --> FailMark
+    
+    FailMark --> ActiveCheck{Active Count < 3?}
+    ActiveCheck -- Yes --> FindStandby{Any Standby <br/> b->started == false?}
+    
+    FindStandby -- Yes --> StartStandby[Launch Next Standby Container]
+    FindStandby -- No --> GetFailed[Find failed container with oldest fail_time_ms]
+    
+    GetFailed --> ResetState[Reset state: started=false, failed=false]
+    ResetState --> StartStandby
+    
+    StartStandby --> LoopStart
+    DetectIssues -- Yes --> LoopStart
+    ActiveCheck -- No --> LoopStart
+    
+    Shutdown[Shutdown Signal Received] --> CleanPorts[Kill All Spawned Container Processes]
+    CleanPorts --> End([Stop Load Balancer])
+```
+
+### 5. Graceful Shutdown Sequence
 Upon capturing termination signals (`SIGINT` or `SIGTERM`):
 1. The Load Balancer terminates the incoming HTTP listener immediately.
 2. It waits for active proxy threads to complete their current operations.
 3. It cleanly terminates the background health checker daemon and joins the threads.
-4. Socket descriptors and resources are destroyed with zero memory leakage.
+4. **Port & Process Cleanup**: It sweeps the active ports and automatically kills all spawned local container processes, freeing up system ports.
+5. Socket descriptors and resources are destroyed with zero memory leakage.
 
 ---
 
@@ -227,6 +275,8 @@ cmake --build cmake-build-debug
    * `LB_PORT=5649`
    * `LB_ADMIN_PORT=5650`
    * `BACKEND_PORTS=8080,8081,8082,8083,8084`
+   * `TARGET_ACTIVE_BACKENDS=3` *(Optional: number of local containers to keep active, default: 3)*
+   * `STARTUP_TIMEOUT=10` *(Optional: time in seconds to wait for a backend to startup, default: 10)*
 5. Press the green **Run** button or press `Ctrl + R`.
 
 ---
