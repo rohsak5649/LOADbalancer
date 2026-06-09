@@ -32,6 +32,41 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
+class ConnectionPool {
+private:
+  std::string host;
+  int port;
+  std::mutex mutex;
+  std::vector<std::unique_ptr<httplib::Client>> clients;
+  size_t max_size;
+
+public:
+  ConnectionPool(std::string h, int p, size_t max_s = 500)
+      : host(h), port(p), max_size(max_s) {}
+
+  std::unique_ptr<httplib::Client> acquire() {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!clients.empty()) {
+      auto cli = std::move(clients.back());
+      clients.pop_back();
+      return cli;
+    }
+    auto cli = std::make_unique<httplib::Client>(host, port);
+    cli->set_connection_timeout(5, 0);
+    cli->set_read_timeout(15, 0);
+    cli->set_write_timeout(15, 0);
+    cli->set_keep_alive(true); // Enable connection reuse
+    return cli;
+  }
+
+  void release(std::unique_ptr<httplib::Client> cli) {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (clients.size() < max_size) {
+      clients.push_back(std::move(cli));
+    }
+  }
+};
+
 // ── Struct definition for backend registry
 struct Backend {
   std::string host;
@@ -46,6 +81,9 @@ struct Backend {
   std::atomic<int> consecutive_failures{0};
   std::atomic<int> consecutive_successes{0};
   std::atomic<int> avg_response_ms{0};
+
+  // Connection Pool for HTTP client reuse
+  std::shared_ptr<ConnectionPool> pool;
 
   // Helper to get formatted string
   std::string endpoint() const { return host + ":" + std::to_string(port); }
@@ -409,6 +447,7 @@ int main() {
           b->port = std::stoi(item.substr(colon + 1));
           b->alive.store(false);
           b->started.store(true); // Docker Compose manages containers
+          b->pool = std::make_shared<ConnectionPool>(b->host, b->port, 500);
           g_backends.push_back(std::move(b));
         } catch (...) {
           log_error("Invalid backend port in specification: " + item);
@@ -444,6 +483,7 @@ int main() {
       b->port = port;
       b->alive.store(false);
       b->started.store(false); // Local mode: started dynamically by LB
+      b->pool = std::make_shared<ConnectionPool>(b->host, b->port, 500);
       g_backends.push_back(std::move(b));
     }
   }
@@ -462,8 +502,11 @@ int main() {
   httplib::Server proxy_svr;
   g_proxy_server = &proxy_svr;
 
-  // Thread pool size: 200, max queued requests: 1000
-  proxy_svr.new_task_queue = [] { return new httplib::ThreadPool(200, 1000); };
+  // Optimizing thread pool dynamically for maximum concurrency
+  proxy_svr.new_task_queue = [] {
+    size_t concurrency = std::max(8u, std::thread::hardware_concurrency() * 16);
+    return new httplib::ThreadPool(concurrency, 10000); // Support up to 10k queued requests
+  };
 
   // ── Proxy forwarding logic
   // IMPORTANT: We use per-method wildcard handlers (NOT
@@ -489,11 +532,8 @@ int main() {
     backend->active_requests++;
     auto start = std::chrono::steady_clock::now();
 
-    // ── Forward to chosen backend
-    httplib::Client cli(backend->host, backend->port);
-    cli.set_connection_timeout(5, 0);
-    cli.set_read_timeout(15, 0);
-    cli.set_write_timeout(15, 0);
+    // ── Acquire client from connection pool (HTTP Keep-Alive reuse)
+    auto cli = backend->pool->acquire();
 
     httplib::Request fwd;
     fwd.method = req.method;
@@ -502,20 +542,22 @@ int main() {
     fwd.params = req.params; // query-string params — client appends as ?k=v
     fwd.body = req.body; // body is fully read before method handlers fire ✅
 
-    // Forward all headers except connection-control and Host
+    // Forward all headers except connection-control, Host, and Connection
     for (const auto &h : req.headers) {
       if (h.first == "Host" ||
           h.first == "Content-Length" || // httplib recomputes from body size
-          h.first == "Transfer-Encoding") {
+          h.first == "Transfer-Encoding" ||
+          h.first == "Connection") { // Skip client connection control to allow socket reuse
         continue;
       }
       fwd.headers.insert(h);
     }
     fwd.headers.emplace("X-LB-Backend", std::to_string(backend->port));
 
-    auto result = cli.send(fwd);
+    auto result = cli->send(fwd);
 
     backend->active_requests--;
+    backend->pool->release(std::move(cli));
     auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::steady_clock::now() - start)
                           .count();
