@@ -12,6 +12,10 @@
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
+#include <filesystem>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -26,12 +30,18 @@
 #include "json.hpp"
 
 using json = nlohmann::json;
+namespace fs = std::filesystem;
 
 // ── Struct definition for backend registry
 struct Backend {
   std::string host;
   int port;
-  std::atomic<bool> alive{true};
+  std::atomic<bool> alive{false};
+  std::atomic<bool> started{false};
+  std::atomic<bool> failed{false};
+  std::atomic<bool> was_alive{false};
+  std::atomic<long long> launch_time_ms{0};
+  std::atomic<long long> fail_time_ms{0};
   std::atomic<int> active_requests{0};
   std::atomic<int> consecutive_failures{0};
   std::atomic<int> consecutive_successes{0};
@@ -50,6 +60,8 @@ static std::chrono::steady_clock::time_point g_start_time;
 static httplib::Server *g_proxy_server = nullptr;
 static httplib::Server *g_admin_server = nullptr;
 
+static std::atomic<bool> g_docker_mode{false};
+
 // Helper to log with formatted timestamps
 static void log_info(const std::string &msg) {
   auto now = std::chrono::system_clock::now();
@@ -65,6 +77,80 @@ static void log_error(const std::string &msg) {
   std::cerr << "["
             << std::put_time(std::localtime(&in_time_t), "%Y-%m-%d %H:%M:%S")
             << "] [ERROR] " << msg << std::endl;
+}
+
+static void kill_process_on_port(int port) {
+  std::string cmd =
+      "PID=$(lsof -t -i :" + std::to_string(port) +
+      "); if [ ! -z \"$PID\" ]; then kill -9 $PID; fi > /dev/null 2>&1";
+  std::system(cmd.c_str());
+}
+
+static fs::path get_container_dir() {
+  fs::path exe_dir;
+#ifdef __APPLE__
+  char path[2048];
+  uint32_t size = sizeof(path);
+  if (_NSGetExecutablePath(path, &size) == 0) {
+    exe_dir = fs::path(path).parent_path();
+  } else {
+    exe_dir = fs::current_path();
+  }
+#else
+  exe_dir = fs::current_path();
+#endif
+
+  exe_dir = fs::weakly_canonical(exe_dir);
+
+  if (fs::exists(exe_dir / "CONTAINER")) {
+    return exe_dir / "CONTAINER";
+  }
+  if (fs::exists(exe_dir.parent_path() / "CONTAINER")) {
+    return exe_dir.parent_path() / "CONTAINER";
+  }
+
+  fs::path current = fs::current_path();
+  if (fs::exists(current / "CONTAINER")) {
+    return current / "CONTAINER";
+  }
+  if (fs::exists(current.parent_path() / "CONTAINER")) {
+    return current.parent_path() / "CONTAINER";
+  }
+
+  return exe_dir / "CONTAINER";
+}
+
+static void start_backend(Backend *b) {
+  if (b->started.load())
+    return;
+
+  kill_process_on_port(b->port);
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  log_info("[LB] Launching container on port " + std::to_string(b->port) +
+           "...");
+
+  auto now = std::chrono::steady_clock::now();
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now.time_since_epoch())
+                .count();
+  b->launch_time_ms.store(ms);
+  b->started.store(true);
+
+#ifdef __APPLE__
+  std::string exec_path =
+      (get_container_dir() / std::to_string(b->port)).string();
+  std::string cmd =
+      "osascript -e 'tell application \"Terminal\" to do script \"" +
+      exec_path + " ; exit\"' > /dev/null 2>&1 &";
+  std::system(cmd.c_str());
+#else
+  std::string exec_path =
+      (get_container_dir() / std::to_string(b->port)).string();
+  std::string cmd =
+      exec_path + " > container_" + std::to_string(b->port) + ".log 2>&1 &";
+  std::system(cmd.c_str());
+#endif
 }
 
 // ── Pick Backend (Least Connections + Round-Robin tie breaker)
@@ -104,12 +190,30 @@ static void health_checker_loop(int interval_seconds) {
   log_info("Health checker thread started (interval: " +
            std::to_string(interval_seconds) + "s)");
 
+  // 1. Initial startup of target active containers if not in Docker mode
+  if (!g_docker_mode.load()) {
+    const char *target_active_env = std::getenv("TARGET_ACTIVE_BACKENDS");
+    int target_active = target_active_env ? std::stoi(target_active_env) : 3;
+    int started_count = 0;
+    for (auto &b : g_backends) {
+      if (started_count < target_active) {
+        start_backend(b.get());
+        started_count++;
+      }
+    }
+  }
+
   while (g_running.load()) {
     std::this_thread::sleep_for(std::chrono::seconds(interval_seconds));
 
     for (auto &b : g_backends) {
       if (!g_running.load())
         break;
+
+      // Skip backends that aren't started or have permanently failed
+      if (!b->started.load() || b->failed.load()) {
+        continue;
+      }
 
       httplib::Client cli(b->host, b->port);
       cli.set_connection_timeout(2, 0); // 2 seconds
@@ -155,6 +259,104 @@ static void health_checker_loop(int interval_seconds) {
         }
       }
     }
+
+    // 2. Failover logic (only in local mode)
+    if (!g_docker_mode.load() && g_running.load()) {
+      auto now = std::chrono::steady_clock::now();
+      auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now.time_since_epoch())
+                        .count();
+
+      const char *startup_timeout_env = std::getenv("STARTUP_TIMEOUT");
+      long long startup_timeout_ms =
+          startup_timeout_env ? std::stoll(startup_timeout_env) * 1000 : 10000;
+
+      for (auto &b : g_backends) {
+        if (b->started.load() && !b->failed.load()) {
+          if (b->alive.load()) {
+            b->was_alive.store(true);
+          } else {
+            bool has_failed = false;
+            if (b->was_alive.load()) {
+              // It was alive, but now it went DOWN (health checker marked it
+              // dead after 2 fails)
+              has_failed = true;
+              log_error("[LB] Backend " + b->endpoint() +
+                        " crashed or stopped responding. Failover triggered.");
+            } else {
+              // Not alive yet. Check startup timeout
+              long long elapsed = now_ms - b->launch_time_ms.load();
+              if (elapsed > startup_timeout_ms) {
+                has_failed = true;
+                log_error("[LB] Backend " + b->endpoint() +
+                          " failed to start within " +
+                          std::to_string(startup_timeout_ms / 1000) +
+                          " seconds. Failover triggered.");
+              }
+            }
+
+            if (has_failed) {
+              b->failed.store(true);
+              b->alive.store(false);
+              auto f_now = std::chrono::steady_clock::now();
+              auto f_ms = std::chrono::duration_cast<std::chrono::milliseconds>(f_now.time_since_epoch()).count();
+              b->fail_time_ms.store(f_ms);
+              kill_process_on_port(b->port);
+            }
+          }
+        }
+      }
+
+      // Count active (started & not failed)
+      int active_count = 0;
+      for (auto &b : g_backends) {
+        if (b->started.load() && !b->failed.load()) {
+          active_count++;
+        }
+      }
+
+      const char *target_active_env = std::getenv("TARGET_ACTIVE_BACKENDS");
+      int target_active = target_active_env ? std::stoi(target_active_env) : 3;
+
+      if (active_count < target_active) {
+        // Collect all inactive / candidate backends
+        std::vector<Backend*> candidates;
+        for (auto &b : g_backends) {
+          if (!b->started.load() || b->failed.load()) {
+            candidates.push_back(b.get());
+          }
+        }
+
+        // Sort candidates: never started first, then failed (oldest fail_time_ms first)
+        std::sort(candidates.begin(), candidates.end(), [](Backend *x, Backend *y) {
+          bool x_never_started = !x->started.load();
+          bool y_never_started = !y->started.load();
+          
+          if (x_never_started != y_never_started) {
+            return x_never_started;
+          }
+          
+          return x->fail_time_ms.load() < y->fail_time_ms.load();
+        });
+
+        int needed = target_active - active_count;
+        for (int i = 0; i < needed && i < (int)candidates.size(); ++i) {
+          Backend *b = candidates[i];
+          
+          // Reset state parameters
+          b->started.store(false);
+          b->failed.store(false);
+          b->was_alive.store(false);
+          b->alive.store(false);
+          b->consecutive_failures.store(0);
+          b->consecutive_successes.store(0);
+          b->fail_time_ms.store(0);
+          
+          start_backend(b);
+          active_count++;
+        }
+      }
+    }
   }
 
   log_info("Health checker thread stopped");
@@ -171,6 +373,16 @@ static void on_signal(int sig) {
   if (g_admin_server) {
     g_admin_server->stop();
   }
+
+  // Clean up running containers if not in Docker mode
+  if (!g_docker_mode.load()) {
+    log_info("[LB] Cleaning up running container processes...");
+    for (auto &b : g_backends) {
+      if (b->started.load()) {
+        kill_process_on_port(b->port);
+      }
+    }
+  }
 }
 
 int main() {
@@ -185,6 +397,7 @@ int main() {
 
   const char *backends_env = std::getenv("BACKENDS");
   if (backends_env) {
+    g_docker_mode.store(true);
     std::stringstream ss(backends_env);
     std::string item;
     while (std::getline(ss, item, ',')) {
@@ -194,8 +407,8 @@ int main() {
           auto b = std::make_unique<Backend>();
           b->host = item.substr(0, colon);
           b->port = std::stoi(item.substr(colon + 1));
-          b->alive.store(
-              false); // BUG FIX 3: start DEAD, health checker promotes
+          b->alive.store(false);
+          b->started.store(true); // Docker Compose manages containers
           g_backends.push_back(std::move(b));
         } catch (...) {
           log_error("Invalid backend port in specification: " + item);
@@ -205,6 +418,7 @@ int main() {
       }
     }
   } else {
+    g_docker_mode.store(false);
     const char *backend_host_env = std::getenv("BACKEND_HOST");
     std::string backend_host =
         backend_host_env ? backend_host_env : "127.0.0.1";
@@ -228,10 +442,8 @@ int main() {
       auto b = std::make_unique<Backend>();
       b->host = backend_host;
       b->port = port;
-      // BUG FIX 3: start as DEAD so LB only routes to backends that
-      // have passed at least 2 health checks. Prevents routing to backends
-      // that look alive=true at startup but aren't actually running yet.
       b->alive.store(false);
+      b->started.store(false); // Local mode: started dynamically by LB
       g_backends.push_back(std::move(b));
     }
   }
