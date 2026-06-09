@@ -67,13 +67,34 @@ An industrial-grade, multithreaded **C++20 Reverse Proxy Load Balancer** specifi
          │   │   Selects best backend container using:         │   │
          │   │   - Least Connections Algorithm                 │   │
          │   │   - Round-Robin fallback on load tie            │   │
-         │   └─────────────────────────────────────────────────┘   │Clients send transactions directly to the Load Balancer on port `5649`. The Load Balancer executes its logic, proxies the transaction to a healthy backend, and routes the response back. Backends on ports `8080` to `8084` are isolated internally and communicate via a shared database container.
+         │   └─────────────────────────────────────────────────┘   │
+         │                                                         │
+         └───────────┬──────────────────┬──────────────┬───────────┘
+                     │                  │              │
+          HTTP Forwarding (with X-LB-Backend tracing header)
+                     │                  │              │
+         ┌───────────▼──┐   ┌───────────▼──┐   ┌───────▼──────┐
+         │  BACKEND-1   │   │  BACKEND-2   │   │  BACKEND-5   │
+         │  Port: 8080  │   │  Port: 8081  │   │  Port: 8084  │
+         │  CardAPI     │   │  CardAPI     │   │  CardAPI     │
+         │  Server Node │   │  Server Node │   │  Server Node │
+         └──────┬───────┘   └──────┬───────┘   └──────┬───────┘
+                │                  │                  │
+                └──────────────────┼──────────────────┘
+                                   │
+                           ┌───────▼───────┐
+                           │   Shared DB   │
+                           │  MySQL Engine │
+                           └───────────────┘
+```
+
+Clients send transactions directly to the Load Balancer on port `5649`. The Load Balancer executes its logic, proxies the transaction to a healthy backend, and routes the response back. Backends on ports `8080` to `8084` are isolated internally and communicate via a shared database container.
 
 ---
 
 ## ⚙️ How It Works Under the Hood
 
-The load balancer manages backend nodes using five parallel asynchronous processes:
+The load balancer manages backend nodes using four parallel asynchronous processes:
 
 ### 1. Least-Connections Routing
 When an HTTP request hits the proxy:
@@ -88,13 +109,7 @@ Unlike basic reverse proxies that use pre-routing interceptors (which trigger *b
 * The proxy copies all incoming headers (excluding connection-handling headers like `Host`, `Content-Length`, and `Transfer-Encoding`, which are recomputed on the fly).
 * An injection header `X-LB-Backend` is populated with the targeted port, simplifying debugging in microservices.
 
-### 3. High-Performance HTTP Connection Pooling (Keep-Alive)
-To handle massive throughput demands, the load balancer implements a thread-safe connection pooling system:
-* **HTTP Keep-Alive Reuse**: Instead of establishing a new TCP connection on every request (which causes local socket exhaustion and handshaking latency), the load balancer maintains a pool of pre-connected client sockets (pool size: 500 connections per backend).
-* **Zero Socket Creation Overhead**: HTTP threads dynamically `acquire` a pre-established socket from the pool and `release` it immediately after forwarding, reducing latency and CPU socket overhead.
-* **Dynamic Concurrency Scaling**: The server's underlying thread pool size scales automatically based on hardware resources (`std::thread::hardware_concurrency() * 16`), ensuring optimal multitasking performance.
-
-### 4. Background Health Checker Daemon
+### 3. Background Health Checker Daemon
 A dedicated worker thread runs in the background at configurable intervals (default: every 3 seconds):
 * It performs a non-blocking `GET /health` call to each backend node.
 * It expects a `200 OK` status and a parsed JSON body containing `"status": "UP"`.
@@ -103,7 +118,7 @@ A dedicated worker thread runs in the background at configurable intervals (defa
   * If a dead node passes the health check **2 consecutive times**, it is restored to the routing pool.
 * State alterations are written using atomic memory structures to prevent race conditions without acquiring heavy OS locks.
 
-### 5. Local Container Lifecycle Manager & Failover Controller
+### 4. Local Container Lifecycle Manager & Failover Controller
 When running in local mode (not in Docker), the load balancer monitors the status of your backend containers:
 * **Initial Auto-Start**: It automatically boots the first 3 containers (ports `8080`, `8081`, `8082`) in separate macOS Terminal windows using AppleScript.
 * **Startup Timeout Detection**: If a started container fails to report healthy (`alive = true`) within 10 seconds (configurable via `STARTUP_TIMEOUT`), it is marked failed.
@@ -145,7 +160,7 @@ graph TD
     CleanPorts --> End([Stop Load Balancer])
 ```
 
-### 6. Graceful Shutdown Sequence
+### 5. Graceful Shutdown Sequence
 Upon capturing termination signals (`SIGINT` or `SIGTERM`):
 1. The Load Balancer terminates the incoming HTTP listener immediately.
 2. It waits for active proxy threads to complete their current operations.
@@ -164,19 +179,11 @@ Every backend node is registered using a dedicated `Backend` struct. All trackin
 struct Backend {
   std::string host;
   int port;
-  std::atomic<bool> alive{false};
-  std::atomic<bool> started{false};
-  std::atomic<bool> failed{false};
-  std::atomic<bool> was_alive{false};
-  std::atomic<long long> launch_time_ms{0};
-  std::atomic<long long> fail_time_ms{0};
+  std::atomic<bool> alive{true};
   std::atomic<int> active_requests{0};
   std::atomic<int> consecutive_failures{0};
   std::atomic<int> consecutive_successes{0};
   std::atomic<int> avg_response_ms{0};
-
-  // Connection Pool for HTTP client reuse
-  std::shared_ptr<ConnectionPool> pool;
 
   std::string endpoint() const { return host + ":" + std::to_string(port); }
 };
