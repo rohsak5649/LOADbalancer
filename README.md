@@ -114,8 +114,8 @@ A dedicated worker thread runs in the background at configurable intervals (defa
 * It performs a non-blocking `GET /health` call to each backend node.
 * It expects a `200 OK` status and a parsed JSON body containing `"status": "UP"`.
 * **Flap Prevention System**:
-  * If a node fails the health check **2 consecutive times**, it is marked `DEAD` and isolated from routing.
-  * If a dead node passes the health check **2 consecutive times**, it is restored to the routing pool.
+   * If a node fails the health check **2 consecutive times**, it is marked `DEAD` and isolated from routing.
+   * If a dead node passes the health check **2 consecutive times**, it is restored to the routing pool.
 * State alterations are written using atomic memory structures to prevent race conditions without acquiring heavy OS locks.
 
 ### 4. Local Container Lifecycle Manager & Failover Controller
@@ -123,7 +123,7 @@ When running in local mode (not in Docker), the load balancer monitors the statu
 * **Initial Auto-Start**: It automatically boots the first 3 containers (ports `8080`, `8081`, `8082`) in separate macOS Terminal windows using AppleScript.
 * **Startup Timeout Detection**: If a started container fails to report healthy (`alive = true`) within 10 seconds (configurable via `STARTUP_TIMEOUT`), it is marked failed.
 * **Hot-Standby Failover**: If any active container crashes or gets marked `DEAD` by the health checker, the load balancer initiates a failover:
-  - It picks the first available standby container (ports `8083` then `8084`) and spawns it to keep exactly 3 containers active.
+   - It picks the first available standby container (ports `8083` then `8084`) and spawns it to keep exactly 3 containers active.
 * **Dynamic Recycling Strategy**: If all containers have run and failed, it automatically recycles the previously failed containers. It prioritizes the container that went down longest ago to maximize its cooldown window.
 
 ```mermaid
@@ -332,7 +332,7 @@ Checks the health of the load balancer itself.
 * **Response Body**:
 ```json
 {
-    "status": "UP"
+   "status": "UP"
 }
 ```
 
@@ -344,58 +344,58 @@ Exposes the real-time operational status, statistics, latency (EMA), active requ
 * **Response Body**:
 ```json
 {
-    "lb_status": "UP",
-    "total_backends": 5,
-    "alive_backends": 5,
-    "total_requests_forwarded": 274,
-    "uptime_seconds": 124,
-    "backends": [
-        {
-            "host": "127.0.0.1",
-            "port": 8080,
-            "alive": true,
-            "active_requests": 0,
-            "avg_response_ms": 14,
-            "consecutive_failures": 0,
-            "consecutive_successes": 42
-        },
-        {
-            "host": "127.0.0.1",
-            "port": 8081,
-            "alive": true,
-            "active_requests": 0,
-            "avg_response_ms": 28,
-            "consecutive_failures": 0,
-            "consecutive_successes": 42
-        },
-        {
-            "host": "127.0.0.1",
-            "port": 8082,
-            "alive": true,
-            "active_requests": 0,
-            "avg_response_ms": 19,
-            "consecutive_failures": 0,
-            "consecutive_successes": 42
-        },
-        {
-            "host": "127.0.0.1",
-            "port": 8083,
-            "alive": true,
-            "active_requests": 0,
-            "avg_response_ms": 22,
-            "consecutive_failures": 0,
-            "consecutive_successes": 42
-        },
-        {
-            "host": "127.0.0.1",
-            "port": 8084,
-            "alive": true,
-            "active_requests": 0,
-            "avg_response_ms": 15,
-            "consecutive_failures": 0,
-            "consecutive_successes": 42
-        }
-    ]
+   "lb_status": "UP",
+   "total_backends": 5,
+   "alive_backends": 5,
+   "total_requests_forwarded": 274,
+   "uptime_seconds": 124,
+   "backends": [
+      {
+         "host": "127.0.0.1",
+         "port": 8080,
+         "alive": true,
+         "active_requests": 0,
+         "avg_response_ms": 14,
+         "consecutive_failures": 0,
+         "consecutive_successes": 42
+      },
+      {
+         "host": "127.0.0.1",
+         "port": 8081,
+         "alive": true,
+         "active_requests": 0,
+         "avg_response_ms": 28,
+         "consecutive_failures": 0,
+         "consecutive_successes": 42
+      },
+      {
+         "host": "127.0.0.1",
+         "port": 8082,
+         "alive": true,
+         "active_requests": 0,
+         "avg_response_ms": 19,
+         "consecutive_failures": 0,
+         "consecutive_successes": 42
+      },
+      {
+         "host": "127.0.0.1",
+         "port": 8083,
+         "alive": true,
+         "active_requests": 0,
+         "avg_response_ms": 22,
+         "consecutive_failures": 0,
+         "consecutive_successes": 42
+      },
+      {
+         "host": "127.0.0.1",
+         "port": 8084,
+         "alive": true,
+         "active_requests": 0,
+         "avg_response_ms": 15,
+         "consecutive_failures": 0,
+         "consecutive_successes": 42
+      }
+   ]
 }
 ```
 
@@ -418,7 +418,7 @@ Querying `/lb/status` while the benchmark is running will show `active_requests`
 ## 🔧 Troubleshooting Guide
 
 #### 1. Why does my POST request return `400 Bad Request` with an `"Empty request body"` error?
-This occurs if the load balancer intercepts requests inside `set_pre_routing_handler`. In `cpp-httplib`, the pre-routing handler runs *before* the server parses the HTTP body, meaning `req.body` is empty. 
+This occurs if the load balancer intercepts requests inside `set_pre_routing_handler`. In `cpp-httplib`, the pre-routing handler runs *before* the server parses the HTTP body, meaning `req.body` is empty.
 * **Fix**: Ensure your Load Balancer routes requests using explicit method handlers (e.g. `proxy_svr.Post(R"(.*)", ...)`) which run *after* the body has been fully buffered in memory.
 
 #### 2. Why does Postman show a blank body but HTTP status `200 OK`?
