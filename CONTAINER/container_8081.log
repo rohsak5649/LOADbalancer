@@ -1,0 +1,21 @@
+[DB] Initialising connection pool (30 sessions)…
+[DB] Pool ready — 30 connections available.
+
+╔══════════════════════════════════════════════════════════╗
+║   Payment Switching Engine  v3.1  –  Rohan Sakhare      ║
+╠══════════════════════════════════════════════════════════╣
+║  http://0.0.0.0:8081   CORS: ENABLED               ║
+║  Thread pool : 1000   DB pool   : 30                     ║
+║  POST /transaction/initiate   POST /account/*            ║
+║  POST /card/{activate,block,set_limit,reset_pin}         ║
+║  POST /3ds/verify             POST /auth/token           ║
+║  POST /reversal/initiate      GET  /health /status       ║
+║  Auth: X-API-Key or Authorization: Bearer <JWT>          ║
+║  Rate limit: 200 req/min per IP                    ║
+╚══════════════════════════════════════════════════════════╝
+
+[Engine] Transaction logs: bin/debug/log
+
+[Engine] Shutdown signal received…
+[Engine] Shutting down…
+[DB] Pool destroyed. Total stale reconnects: 0
