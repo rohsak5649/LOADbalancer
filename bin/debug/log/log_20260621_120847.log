@@ -1,0 +1,5 @@
+# Payment Switching Engine readable transaction log
+# Search any request with: uuid=<transactionUuid>
+# Format: time | level | uuid | channel | event | message | key=value...
+2026-06-21 12:08:47.517 | INFO | uuid=0052ea6d-c36b-4dc1-90f4-904b0027b5ed | channel=ENGINE | event=engine_starting | message="Payment Switching Engine starting" | thread=0x2004eb080 port=8080 threadPool=1000 dbPool=30 logDirectory=bin/debug/log
+2026-06-21 12:08:47.746 | INFO | uuid=0052ea6d-c36b-4dc1-90f4-904b0027b5ed | channel=ENGINE | event=db_pool_ready | message="Database connection pool initialized" | thread=0x2004eb080 poolSize=30
