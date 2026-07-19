@@ -47,48 +47,38 @@ It features a thread-safe, lock-free **Least-Connections** scheduling algorithm 
 ### High-Level System Block Diagram
 The load balancer sits on external ports, intercepting incoming HTTP transactions and proxying them to isolated backend microservices, which share a database.
 
-```
-                 ┌────────────────────────────────────────┐
-                 │       EXTERNAL CLIENT TRAFFIC          │
-                 │   POS Terminals, Mobile Apps, ATMs     │
-                 └──────────────────┬─────────────────────┘
-                                    │
-                       HTTP Requests (Port 5649)
-                                    │
-                                    ▼
-       ┌──────────────────────────────────────────────────────────┐
-       │             LOAD BALANCER SERVICE (Port 5649)            │
-       │                                                          │
-       │   ┌──────────────────────────────────────────────────┐   │
-       │   │         BACKGROUND HEALTH DAEMON (Thread)        │   │
-       │   │ Pings /health, manages Flap Thresholds (2x/2x)  │   │
-       │   └──────────────────────────────────────────────────┘   │
-       │                                                          │
-       │   ┌──────────────────────────────────────────────────┐   │
-       │   │      LOCAL LIFECYCLE MANAGER (Local Mode Only)   │   │
-       │   │ Auto-boots & recycles standby nodes on port loss│   │
-       │   └──────────────────────────────────────────────────┘   │
-       │                                                          │
-       │   ┌──────────────────────────────────────────────────┐   │
-       │   │             LEAST-CONNECTIONS ENGINE             │   │
-       │   │  Picks lowest active_requests; RR tie-breaker    │   │
-       │   └──────────────────────────────────────────────────┘   │
-       │                                                          │
-       └────────────┬─────────────────┬─────────────────┬─────────┘
-                    │                 │                 │
-             HTTP Proxying (with X-LB-Backend Header)
-                    │                 │                 │
-       ┌────────────▼─┐  ┌────────────▼─┐  ┌────────────▼─┐
-       │  BACKEND-1   │  │  BACKEND-2   │  │  BACKEND-N   │
-       │  Port: 8080  │  │  Port: 8081  │  │  Port: 8084  │
-       │  CardAPI     │  │  CardAPI     │  │  CardAPI     │
-       └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
-              │                 │                 │
-              └─────────────────┼─────────────────┘
-                                │
-                       ┌────────▼────────┐
-                       │  MySQL Database │
-                       └─────────────────┘
+```mermaid
+graph TD
+    subgraph Clients["EXTERNAL CLIENT TRAFFIC"]
+        C[POS Terminals, Mobile Apps, ATMs]
+    end
+
+    C -->|HTTP Requests Port 5649| LB
+
+    subgraph LB_Service["LOAD BALANCER SERVICE (Port 5649)"]
+        LB[Request Router]
+        HC["BACKGROUND HEALTH DAEMON (Thread)<br/>Pings /health, manages Flap Thresholds (2x/2x)"]
+        LC["LOCAL LIFECYCLE MANAGER (Local Mode)<br/>Auto-boots & recycles standby nodes"]
+        Engine["LEAST-CONNECTIONS ENGINE<br/>Picks lowest active_requests; RR tie-breaker"]
+        
+        LB -.-> HC
+        LB -.-> LC
+        LB -.-> Engine
+    end
+
+    Engine -->|HTTP Proxying with X-LB-Backend Header| B1
+    Engine -->|HTTP Proxying with X-LB-Backend Header| B2
+    Engine -->|HTTP Proxying with X-LB-Backend Header| BN
+
+    subgraph Backends["BACKEND SERVER INSTANCES"]
+        B1["BACKEND-1<br/>Port: 8080<br/>CardAPI Server Node"]
+        B2["BACKEND-2<br/>Port: 8081<br/>CardAPI Server Node"]
+        BN["BACKEND-N<br/>Port: 8084<br/>CardAPI Server Node"]
+    end
+
+    B1 --> DB[(MySQL Database)]
+    B2 --> DB
+    BN --> DB
 ```
 
 ### End-to-End Request Sequence Flow
