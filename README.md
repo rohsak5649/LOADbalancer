@@ -1,303 +1,396 @@
-# High-Performance C++20 Reverse Proxy Load Balancer
+# 🚀 High-Performance C++20 Reverse Proxy Load Balancer
 
-[![C++ Standard](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://en.cppreference.com/w/cpp/compiler_support/20)
-[![Build Status](https://img.shields.io/badge/Build-CMake%20%7C%20Ninja-brightgreen.svg)]()
-[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-lightgrey.svg)]()
-[![License](https://img.shields.io/badge/License-MIT-gold.svg)](LICENSE)
+[![C++ Standard](https://img.shields.io/badge/C%2B%2B-20-blue.svg?style=for-the-badge&logo=c%2B%2B)](https://en.cppreference.com/w/cpp/compiler_support/20)
+[![Build Status](https://img.shields.io/badge/Build-CMake%20%7C%20Ninja-brightgreen.svg?style=for-the-badge&logo=cmake)](https://cmake.org)
+[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-lightgrey.svg?style=for-the-badge&logo=apple)](https://www.apple.com/macos/)
+[![Docker Compose](https://img.shields.io/badge/Docker%20Compose-Orchestrated-blue?style=for-the-badge&logo=docker)](https://www.docker.com/)
+[![License](https://img.shields.io/badge/License-MIT-gold.svg?style=for-the-badge)](LICENSE)
 
-An industrial-grade, multithreaded **C++20 Reverse Proxy Load Balancer** specifically designed to scale card payment switching API engines (like `CardAPIServer`). It sits on public-facing ports, dynamically intercepting traffic, and balances requests across multiple backend container nodes using a thread-safe, lock-free **Least-Connections** scheduling algorithm with **Round-Robin** fallback tie-breakers.
+An industrial-grade, multithreaded **C++20 Reverse Proxy Load Balancer** specifically designed to scale high-concurrency payment switching engines (such as `CardAPIServer`). Operating at the public entry point, it intercepts HTTP traffic and distributes transaction requests across backend server instances. 
+
+It features a thread-safe, lock-free **Least-Connections** scheduling algorithm with a high-performance **Round-Robin** fallback tie-breaker, a background health monitor with **Flap Prevention**, a local **Hot-Standby Failover Lifecycle Manager**, and administrative metrics endpoints.
 
 ---
 
 ## 📖 Table of Contents
-1. [Big Picture Architecture](#-big-picture-architecture)
-2. [How It Works Under the Hood](#-how-it-works-under-the-hood)
-   * [Least-Connections Routing](#1-least-connections-routing)
-   * [Wildcard Method Routing & Request Body Handling](#2-wildcard-method-routing--request-body-handling)
-   * [Background Health Checker Daemon](#3-background-health-checker-daemon)
-   * [Graceful Shutdown Sequence](#4-graceful-shutdown-sequence)
-3. [Deep-Dive Code Walkthrough](#%EF%B8%8F-deep-dive-code-walkthrough)
-   * [Thread-Safe Lock-Free Registry Structs](#thread-safe-lock-free-registry-structs)
-   * [Decoupled Logging and Timing Helpers](#decoupled-logging-and-timing-helpers)
-4. [Setting Up & Running Locally](#%EF%B8%8F-setting-up--running-locally)
+1. [System Architecture & Traffic Flow](#-system-architecture--traffic-flow)
+   * [High-Level System Block Diagram](#high-level-system-block-diagram)
+   * [End-to-End Request Sequence Flow](#end-to-end-request-sequence-flow)
+2. [Internal Mechanics & Functionality](#-internal-mechanics--functionality)
+   * [1. Thread-Safe, Lock-Free Backend Registry](#1-thread-safe-lock-free-backend-registry)
+   * [2. High-Performance Connection Pool](#2-high-performance-connection-pool)
+   * [3. Least-Connections Routing & Tie-Breaker](#3-least-connections-routing--tie-breaker)
+   * [4. Wildcard Request Proxying & Body Buffering](#4-wildcard-request-proxying--body-buffering)
+   * [5. Daemon Health Checker & Flap Prevention](#5-daemon-health-checker--flap-prevention)
+   * [6. Local Container Lifecycle & Failover Manager](#6-local-container-lifecycle--failover-manager)
+   * [7. Graceful Shutdown & Cleanup Sequence](#7-graceful-shutdown--cleanup-sequence)
+3. [Configuration & Environment Variables](#-configuration--environment-variables)
+4. [Setting Up & Running Locally](#-setting-up--running-locally)
    * [Build Requirements](#build-requirements)
    * [Building via CLI (CMake & Ninja)](#building-via-cli-cmake--ninja)
    * [Running in CLion IDE](#running-in-clion-ide)
-5. [Docker Orchestrated Setup (5 Backend Nodes + DB + LB)](#-docker-orchestrated-setup-5-backend-nodes--db--lb)
-   * [Directory Structure Expectation](#directory-structure-expectation)
-   * [Troubleshooting the MySQL Connection Limit](#troubleshooting-the-mysql-connection-limit)
-   * [Running the Docker Stack](#running-the-docker-stack)
+5. [Docker Orchestrated Setup](#-docker-orchestrated-setup-5-backends--db--lb)
+   * [Directory Layout](#directory-layout)
+   * [Database Capacity Configuration (Crucial)](#database-capacity-configuration-crucial)
+   * [Starting the Docker Stack](#starting-the-docker-stack)
 6. [Monitoring & Administrative APIs](#-monitoring--administrative-apis)
    * [`GET /lb/health`](#get-lbhealth)
-   * [`GET /lb/status`](#get-lbstatus)
-7. [Simulating and Testing Load Balancing](#%EF%B8%8F-simulating-and-testing-load-balancing)
-8. [Troubleshooting Guide](#%EF%B8%8F-troubleshooting-guide)
-9. [Author Information](#-author-information)
+   * [`GET /lb/status` (Metrics Console)](#get-lbstatus-metrics-console)
+7. [Load Simulation & Benchmarking](#-load-simulation--benchmarking)
+8. [Troubleshooting Guide](#-troubleshooting-guide)
+9. [Developer Contact Info](#-developer-contact-info)
 
 ---
 
-## 🏗️ Big Picture Architecture
+## 🏗️ System Architecture & Traffic Flow
+
+### High-Level System Block Diagram
+The load balancer sits on external ports, intercepting incoming HTTP transactions and proxying them to isolated backend microservices, which share a database.
 
 ```
-                  ┌────────────────────────────────────────┐
-                  │         EXTERNAL WORLD (Clients)       │
-                  │   POS Terminals, Mobile Apps, ATMs,    │
-                  │   E-Commerce Gateways, QR Scanners     │
-                  └──────────────────┬─────────────────────┘
-                                     │
-                             HTTP Requests (e.g. POST /transaction/initiate)
-                                     │
-                                     ▼
-         ┌─────────────────────────────────────────────────────────┐
-         │                                                         │
-         │          LOAD BALANCER SERVICE (Port 5649)              │
-         │                                                         │
-         │   ┌─────────────────────────────────────────────────┐   │
-         │   │          HEALTH MONITOR (Background)            │   │
-         │   │   Pings /health on each backend periodically.   │   │
-         │   └─────────────────────────────────────────────────┘   │
-         │                                                         │
-         │   ┌─────────────────────────────────────────────────┐   │
-         │   │          LIFECYCLE MANAGER (Local Mode)         │   │
-         │   │   Starts 3 active, auto-failover & recycling.    │   │
-         │   └─────────────────────────────────────────────────┘   │
-         │                                                         │
-         │   ┌─────────────────────────────────────────────────┐   │
-         │   │          LOAD DECISION ENGINE                   │   │
-         │   │   Selects best backend container using:         │   │
-         │   │   - Least Connections Algorithm                 │   │
-         │   │   - Round-Robin fallback on load tie            │   │
-         │   └─────────────────────────────────────────────────┘   │
-         │                                                         │
-         └───────────┬──────────────────┬──────────────┬───────────┘
-                     │                  │              │
-          HTTP Forwarding (with X-LB-Backend tracing header)
-                     │                  │              │
-         ┌───────────▼──┐   ┌───────────▼──┐   ┌───────▼──────┐
-         │  BACKEND-1   │   │  BACKEND-2   │   │  BACKEND-5   │
-         │  Port: 8080  │   │  Port: 8081  │   │  Port: 8084  │
-         │  CardAPI     │   │  CardAPI     │   │  CardAPI     │
-         │  Server Node │   │  Server Node │   │  Server Node │
-         └──────┬───────┘   └──────┬───────┘   └──────┬───────┘
-                │                  │                  │
-                └──────────────────┼──────────────────┘
-                                   │
-                           ┌───────▼───────┐
-                           │   Shared DB   │
-                           │  MySQL Engine │
-                           └───────────────┘
+                 ┌────────────────────────────────────────┐
+                 │       EXTERNAL CLIENT TRAFFIC          │
+                 │   POS Terminals, Mobile Apps, ATMs     │
+                 └──────────────────┬─────────────────────┘
+                                    │
+                       HTTP Requests (Port 5649)
+                                    │
+                                    ▼
+       ┌──────────────────────────────────────────────────────────┐
+       │             LOAD BALANCER SERVICE (Port 5649)            │
+       │                                                          │
+       │   ┌──────────────────────────────────────────────────┐   │
+       │   │         BACKGROUND HEALTH DAEMON (Thread)        │   │
+       │   │ Pings /health, manages Flap Thresholds (2x/2x)  │   │
+       │   └──────────────────────────────────────────────────┘   │
+       │                                                          │
+       │   ┌──────────────────────────────────────────────────┐   │
+       │   │      LOCAL LIFECYCLE MANAGER (Local Mode Only)   │   │
+       │   │ Auto-boots & recycles standby nodes on port loss│   │
+       │   └──────────────────────────────────────────────────┘   │
+       │                                                          │
+       │   ┌──────────────────────────────────────────────────┐   │
+       │   │             LEAST-CONNECTIONS ENGINE             │   │
+       │   │  Picks lowest active_requests; RR tie-breaker    │   │
+       │   └──────────────────────────────────────────────────┘   │
+       │                                                          │
+       └────────────┬─────────────────┬─────────────────┬─────────┘
+                    │                 │                 │
+             HTTP Proxying (with X-LB-Backend Header)
+                    │                 │                 │
+       ┌────────────▼─┐  ┌────────────▼─┐  ┌────────────▼─┐
+       │  BACKEND-1   │  │  BACKEND-2   │  │  BACKEND-N   │
+       │  Port: 8080  │  │  Port: 8081  │  │  Port: 8084  │
+       │  CardAPI     │  │  CardAPI     │  │  CardAPI     │
+       └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+              │                 │                 │
+              └─────────────────┼─────────────────┘
+                                │
+                       ┌────────▼────────┐
+                       │  MySQL Database │
+                       └─────────────────┘
 ```
 
-Clients send transactions directly to the Load Balancer on port `5649`. The Load Balancer executes its logic, proxies the transaction to a healthy backend, and routes the response back. Backends on ports `8080` to `8084` are isolated internally and communicate via a shared database container.
-
----
-
-## ⚙️ How It Works Under the Hood
-
-The load balancer manages backend nodes using four parallel asynchronous processes:
-
-### 1. Least-Connections Routing
-When an HTTP request hits the proxy:
-1. It queries the registry of backends and filters out all nodes marked `alive = false`.
-2. Out of the active hosts, it checks the atomic `active_requests` counter.
-3. The host processing the lowest number of concurrent requests is selected.
-4. **Tie-Breaker Strategy**: If multiple nodes are tied for the lowest load, a global atomic index is incremented to dynamically round-robin the request among the tied hosts.
-
-### 2. Wildcard Method Routing & Request Body Handling
-Unlike basic reverse proxies that use pre-routing interceptors (which trigger *before* reading the request body, leaving `req.body` empty), this proxy implements regex wildcard matching for explicit HTTP methods (`Get`, `Post`, `Put`, `Delete`, `Patch`, `Options`).
-* This guarantees the request body is **fully read and buffered** before routing.
-* The proxy copies all incoming headers (excluding connection-handling headers like `Host`, `Content-Length`, and `Transfer-Encoding`, which are recomputed on the fly).
-* An injection header `X-LB-Backend` is populated with the targeted port, simplifying debugging in microservices.
-
-### 3. Background Health Checker Daemon
-A dedicated worker thread runs in the background at configurable intervals (default: every 3 seconds):
-* It performs a non-blocking `GET /health` call to each backend node.
-* It expects a `200 OK` status and a parsed JSON body containing `"status": "UP"`.
-* **Flap Prevention System**:
-  * If a node fails the health check **2 consecutive times**, it is marked `DEAD` and isolated from routing.
-  * If a dead node passes the health check **2 consecutive times**, it is restored to the routing pool.
-* State alterations are written using atomic memory structures to prevent race conditions without acquiring heavy OS locks.
-
-### 4. Local Container Lifecycle Manager & Failover Controller
-When running in local mode (not in Docker), the load balancer monitors the status of your backend containers:
-* **Initial Auto-Start**: It automatically boots the first 3 containers (ports `8080`, `8081`, `8082`) in separate macOS Terminal windows using AppleScript.
-* **Startup Timeout Detection**: If a started container fails to report healthy (`alive = true`) within 10 seconds (configurable via `STARTUP_TIMEOUT`), it is marked failed.
-* **Hot-Standby Failover**: If any active container crashes or gets marked `DEAD` by the health checker, the load balancer initiates a failover:
-  - It picks the first available standby container (ports `8083` then `8084`) and spawns it to keep exactly 3 containers active.
-* **Dynamic Recycling Strategy**: If all containers have run and failed, it automatically recycles the previously failed containers. It prioritizes the container that went down longest ago to maximize its cooldown window.
+### End-to-End Request Sequence Flow
+The following sequence diagram describes the path of an incoming API request through the proxy:
 
 ```mermaid
-graph TD
-    Start([Load Balancer Starts]) --> CheckMode{Docker Mode?}
-    CheckMode -- Yes --> HealthChecksOnly[Health Checks Active Backends]
-    CheckMode -- No (Local) --> InitLaunch[Launch First 3 Containers: 8080, 8081, 8082]
-    
-    InitLaunch --> LoopStart[Every 3 Seconds Health Check]
-    
-    LoopStart --> CheckAlives[Verify Started & Active Backends]
-    CheckAlives --> DetectIssues{Is Backend Alive?}
-    
-    DetectIssues -- Yes --> MarkWasAlive[was_alive = true]
-    DetectIssues -- No --> CheckFailReason{Fail Reason?}
-    
-    CheckFailReason -- was_alive is true --> FailMark[Mark failed = true, Release Port]
-    CheckFailReason -- was_alive is false & Time > 10s --> FailMark
-    
-    FailMark --> ActiveCheck{Active Count < 3?}
-    ActiveCheck -- Yes --> FindStandby{Any Standby <br/> b->started == false?}
-    
-    FindStandby -- Yes --> StartStandby[Launch Next Standby Container]
-    FindStandby -- No --> GetFailed[Find failed container with oldest fail_time_ms]
-    
-    GetFailed --> ResetState[Reset state: started=false, failed=false]
-    ResetState --> StartStandby
-    
-    StartStandby --> LoopStart
-    DetectIssues -- Yes --> LoopStart
-    ActiveCheck -- No --> LoopStart
-    
-    Shutdown[Shutdown Signal Received] --> CleanPorts[Kill All Spawned Container Processes]
-    CleanPorts --> End([Stop Load Balancer])
-```
+sequenceDiagram
+    autonumber
+    actor Client
+    participant LB as Load Balancer
+    participant Registry as Backend Registry
+    participant Pool as Connection Pool
+    participant Backend as Backend Server
 
-### 5. Graceful Shutdown Sequence
-Upon capturing termination signals (`SIGINT` or `SIGTERM`):
-1. The Load Balancer terminates the incoming HTTP listener immediately.
-2. It waits for active proxy threads to complete their current operations.
-3. It cleanly terminates the background health checker daemon and joins the threads.
-4. **Port & Process Cleanup**: It sweeps the active ports and automatically kills all spawned local container processes, freeing up system ports.
-5. Socket descriptors and resources are destroyed with zero memory leakage.
+    Client->>LB: Send HTTP Request (e.g. POST /transaction/initiate)
+    Note over LB: Worker Thread allocated<br/>from ThreadPool
+    LB->>Registry: pick_backend()
+    Registry-->>LB: Return Selected Backend (e.g. Backend-1 on 8080)
+    Note over LB: Atomically increment active_requests
+    LB->>Pool: acquire() client connection
+    Pool-->>LB: Return Client connection (httplib::Client)
+    Note over LB: Copy and sanitize headers<br/>Inject X-LB-Backend: 8080
+    LB->>Backend: Forward request payload
+    Backend-->>LB: Return Response (HTTP 200 OK, payload)
+    Note over LB: Record end time & calculate latency<br/>Update rolling 10-sample Latency EMA
+    Note over LB: Atomically decrement active_requests
+    LB->>Pool: release() client connection (resets socket state)
+    LB->>Client: Send HTTP Response (copy payload & headers)
+```
 
 ---
 
-## 🖥️ Deep-Dive Code Walkthrough
+## ⚙️ Internal Mechanics & Functionality
 
-### Thread-Safe Lock-Free Registry Structs
-Every backend node is registered using a dedicated `Backend` struct. All tracking state elements utilize standard C++ atomic wrappers.
+### 1. Thread-Safe, Lock-Free Backend Registry
+At the core of the routing architecture is the `Backend` registry. Since multiple HTTP worker threads process requests concurrently while the background health daemon updates node statuses, standard data structures would suffer from race conditions or lock contention.
+
+To prevent this, status variables use C++ standard atomics (`std::atomic`). This permits simultaneous read and write operations on backend parameters without requiring heavy operating system mutexes.
 
 ```cpp
 struct Backend {
   std::string host;
   int port;
-  std::atomic<bool> alive{true};
-  std::atomic<int> active_requests{0};
+  std::string endpoint_str; // Cached "host:port"
+
+  std::atomic<bool> alive{false};
+  std::atomic<bool> started{false};
+  std::atomic<bool> failed{false};
+  std::atomic<bool> was_alive{false};
+  std::atomic<long long> launch_time_ms{0};
+  std::atomic<long long> fail_time_ms{0};
+  std::atomic<int> active_requests{0}; // Signed to prevent silent underflows
   std::atomic<int> consecutive_failures{0};
   std::atomic<int> consecutive_successes{0};
-  std::atomic<int> avg_response_ms{0};
+  std::atomic<long long> avg_response_ms{0}; // Rolling average latency
+  std::atomic<int> restart_attempts{0};
 
-  std::string endpoint() const { return host + ":" + std::to_string(port); }
+  std::shared_ptr<ConnectionPool> pool;
+
+  const std::string &endpoint() const { return endpoint_str; }
 };
 ```
-* Using `std::atomic` variables ensures that incoming HTTP worker threads and the background health checker thread can read and modify states simultaneously without causing race conditions or undefined behavior.
-* Registered instances are maintained within a `std::vector<std::unique_ptr<Backend>>`. Storing smart pointers (`unique_ptr`) prevents memory reallocations inside the vector from invoking vector moves that would otherwise copy non-copyable atomic variables.
 
-### Least-Connections Core Implementation
-The algorithm executes a single-pass search over the registry to identify candidate backend nodes:
+> [!NOTE]
+> Registry nodes are kept inside a `std::vector<std::unique_ptr<Backend>>`. Using smart pointers (`unique_ptr`) prevents vector reallocations from invoking copy or move constructors on non-copyable `std::atomic` variables.
+
+---
+
+### 2. High-Performance Connection Pool
+Instead of opening and closing TCP sockets for every request, the Load Balancer maintains a bounded, thread-safe `ConnectionPool` for each backend using Keep-Alive connections.
+
+```cpp
+class ConnectionPool {
+private:
+  std::string host_;
+  int port_;
+  std::mutex mutex_;
+  std::vector<httplib::Client *> clients_;
+  size_t max_size_;
+  // ...
+public:
+  std::unique_ptr<httplib::Client> acquire();
+  void release(std::unique_ptr<httplib::Client> cli);
+};
+```
+
+#### Core Pool Optimizations:
+* **Stale Socket Flushing**: When releasing a connection back to the pool, the load balancer calls `cli->stop()`. This flushes the socket descriptors, forcing `cpp-httplib` to negotiate a fresh TCP connection on the next request, preventing `ECONNRESET` or silent request drops.
+* **Destructor Thread Safety**: The pool destructor acquires a lock before deleting clients to avoid data races with thread releases during shutdown.
+
+---
+
+### 3. Least-Connections Routing & Tie-Breaker
+When a request is intercepted, `pick_backend()` scans the backend registry to identify the server handling the lowest load:
 
 ```cpp
 static Backend *pick_backend() {
-  std::vector<Backend *> candidates;
+  static constexpr size_t kMaxCandidates = 64;
+  Backend *candidates[kMaxCandidates];
+  size_t candidate_count = 0;
   int min_conn = std::numeric_limits<int>::max();
 
-  for (auto &b : g_backends) {
-    if (b->alive.load()) {
-      int active = b->active_requests.load();
-      if (active < min_conn) {
-        min_conn = active;
-        candidates.clear();
-        candidates.push_back(b.get());
-      } else if (active == min_conn) {
-        candidates.push_back(b.get());
-      }
+  const size_t n = g_backends.size();
+  for (size_t i = 0; i < n; ++i) {
+    Backend *b = g_backends[i].get();
+    if (!b->alive.load(std::memory_order_relaxed))
+      continue;
+    
+    int active = b->active_requests.load(std::memory_order_relaxed);
+    if (active < min_conn) {
+      min_conn = active;
+      candidates[0] = b;
+      candidate_count = 1;
+    } else if (active == min_conn && candidate_count < kMaxCandidates) {
+      candidates[candidate_count++] = b;
     }
   }
 
-  if (candidates.empty()) return nullptr;
-  if (candidates.size() == 1) return candidates[0];
+  if (candidate_count == 0) return nullptr;
+  if (candidate_count == 1) return candidates[0];
 
   // Tie-breaker: Round-Robin selection
   static std::atomic<size_t> rr_index{0};
   size_t index = rr_index.fetch_add(1, std::memory_order_relaxed);
-  return candidates[index % candidates.size()];
+  return candidates[index % candidate_count];
 }
 ```
 
-### Decoupled Logging and Timing Helpers
-Logs include human-readable ISO-like timestamps outputting to `stdout` (for informational trails) and `stderr` (for exceptions and failures):
-
-```cpp
-static void log_info(const std::string &msg) {
-  auto now = std::chrono::system_clock::now();
-  auto in_time_t = std::chrono::system_clock::to_time_t(now);
-  std::cout << "[" << std::put_time(std::localtime(&in_time_t), "%Y-%m-%d %H:%M:%S") 
-            << "] [INFO] " << msg << std::endl;
-}
-```
-
-Response times are tracked using a high-precision `std::chrono::steady_clock`. Latencies are stored in the backend registry node as a 10-sample **Exponential Moving Average (EMA)** to provide a rolling reflection of performance:
-
-```cpp
-int old_avg = backend->avg_response_ms.load();
-backend->avg_response_ms.store(
-    old_avg == 0 ? elapsed_ms : (old_avg * 9 + elapsed_ms) / 10
-);
-```
+#### Selection Flow:
+1. **Liveness Filter**: Only nodes where `alive == true` are evaluated.
+2. **Load Evaluation**: The engine locates the minimum `active_requests` counter.
+3. **Array Caching**: Candidate servers tied for the minimum load are stored in a fixed-size stack array (no dynamic allocations).
+4. **Round-Robin Tie-Breaker**: If multiple servers are tied, a thread-safe, lock-free global counter (`rr_index`) selects the candidate on a round-robin basis using relaxed memory ordering.
 
 ---
 
-## 🛠️ Setting Up & Running Locally
+### 4. Wildcard Request Proxying & Body Buffering
+Standard reverse proxies that hook into pre-routing handlers run *before* reading the request body, leaving `req.body` unpopulated and causing POST requests to fail with body verification errors.
+
+To solve this, this proxy registers explicit HTTP wildcard methods:
+
+```cpp
+proxy_svr.Get(R"(.*)", proxy_handler);
+proxy_svr.Post(R"(.*)", proxy_handler);
+proxy_svr.Put(R"(.*)", proxy_handler);
+proxy_svr.Delete(R"(.*)", proxy_handler);
+proxy_svr.Patch(R"(.*)", proxy_handler);
+proxy_svr.Options(R"(.*)", proxy_handler);
+```
+
+#### Handling Steps:
+* **Full Buffering**: The proxy waits for the client request to be fully loaded into memory before starting the forwarding handler.
+* **Header Sanitization**: Hop-by-hop headers (`Host`, `Content-Length`, `Transfer-Encoding`, `Connection`) are filtered out and recomputed dynamically before forwarding to prevent backend communication mismatches.
+* **Backend Ingress Tracing**: An tracking header `X-LB-Backend: <port>` is injected, simplifying transaction tracing across microservices.
+* **Latency Tracking**: Response times are measured with `std::chrono::steady_clock` and recorded as a 10-sample **Exponential Moving Average (EMA)** to provide a rolling representation of performance:
+  $$\text{EMA}_{\text{new}} = \frac{(\text{EMA}_{\text{old}} \times 9) + \text{Latency}}{10}$$
+
+---
+
+### 5. Daemon Health Checker & Flap Prevention
+A dedicated background thread runs continuously to verify backend availability and prevent flapping (repeatedly marking a server alive and dead due to intermittent network glitches).
+
+```mermaid
+graph TD
+    Start([Default State]) --> DEAD[DEAD: alive=false]
+    DEAD -->|Health Check Fails| DEAD
+    DEAD -->|1st Success| Recovering[Recovering State]
+    Recovering -->|Health Check Fails| DEAD
+    Recovering -->|2nd Consecutive Success| ALIVE[ALIVE: alive=true]
+    ALIVE -->|Health Check Passes| ALIVE
+    ALIVE -->|1st Failure| Degrading[Degrading State]
+    Degrading -->|Health Check Passes| ALIVE
+    Degrading -->|2nd Consecutive Failure| DEAD
+```
+
+#### Mechanics:
+* **Active Probe**: Every 3 seconds, the thread pings `/health` on all registered servers.
+* **State Parsing**: It accepts HTTP 200 OK and validates the status JSON body containing `"status": "UP"`.
+* **Lock-Free State Updates**: Transitions use atomic `compare_exchange_strong` to prevent collisions:
+  - **Failures to Dead**: Needs **2 consecutive failed checks** before marking the node dead and removing it from rotation.
+  - **Recovery to Alive**: Needs **2 consecutive successful checks** before restoring the node to the active routing pool.
+
+---
+
+### 6. Local Container Lifecycle & Failover Manager
+When running in **Local Mode** (outside Docker), the Load Balancer acts as an active supervisor for the backend processes on your machine.
+
+```mermaid
+graph TD
+    A([Start Load Balancer]) --> B{Docker Mode?}
+    B -->|Yes| C[Background Health Checks Only]
+    B -->|No| D[Launch Target Active Nodes: 8080, 8081, 8082]
+    
+    D --> E[Every 3 Seconds Health Check Loop]
+    E --> F[Check Started & Active Backends]
+    
+    F --> G{Is Backend Alive?}
+    G -->|Yes| H[Update: was_alive = true]
+    H --> E
+    G -->|No| I{Crashed or Timeout >10s?}
+    
+    I -->|No| E
+    I -->|Yes| J[Mark failed=true, Kill process on Port]
+    
+    J --> K{Active Nodes < 3?}
+    K -->|No| E
+    K -->|Yes| L{Any Unstarted Standby Available?}
+    
+    L -->|Yes| M[Launch Next Standby Container]
+    M --> E
+    L -->|No| N[Find Failed Container with Oldest fail_time_ms]
+    N --> O[Reset State: started=false, failed=false]
+    O --> M
+```
+
+#### Key Capabilities:
+* **Background Startup**: Backends are launched as detached background processes using `std::system`. Output is redirected to individual log files (`CONTAINER/container_<port>.log`) for debugging.
+* **C++20 Double-Start Guard**: Uses `compare_exchange_strong` on the `started` atomic flag to prevent threads from double-booting the same process.
+* **Hot-Standby Failover**: The lifecycle manager targets keeping exactly 3 containers active. If one crashes, it immediately spawns a standby container (e.g. ports `8083` or `8084`).
+* **Dynamic Recycling Strategy**: If all standby containers are exhausted and fail, the manager sorts the failed nodes by `fail_time_ms`. It resets and restarts the node that went down **longest ago** to allow for maximum cooldown time.
+
+---
+
+### 7. Graceful Shutdown & Cleanup Sequence
+To prevent zombie processes and port conflicts, the load balancer implements clean termination handling:
+
+1. **Signal Interception**: Captures `SIGINT` (Ctrl+C), `SIGTERM`, `SIGHUP`, and `SIGQUIT` via signal handlers.
+2. **Listener Shutdown**: Safely signals the HTTP servers (`proxy_svr` and `admin_svr`) to stop listening for new traffic using atomic server pointers.
+3. **Thread Joining**: Joins the background health daemon thread and the admin server thread.
+4. **Local Process Cleanup**: A thread-safe `std::once_flag` block executes a clean-up routine that sweeps the active ports, resolves running PIDs, and kills the backend binaries (`kill -9`).
+
+---
+
+## 📋 Configuration & Environment Variables
+
+The Load Balancer behaves dynamically based on the following environment variables:
+
+| Environment Variable | Type | Default Value | Description |
+| :--- | :--- | :--- | :--- |
+| `LB_PORT` | Integer | `5649` | Port where the proxy server listens for client requests. |
+| `LB_ADMIN_PORT` | Integer | `5650` | Port where the administrative metrics console listens. |
+| `BACKENDS` | String | *None* | Comma-separated `"host:port"` strings. **Setting this enables Docker Mode** (disables process spawning). |
+| `BACKEND_HOST` | String | `127.0.0.1` | Target IP address for local backend nodes. |
+| `BACKEND_PORTS` | String | `8080,8081,8082,8083,8084` | Comma-separated list of ports for local backends. |
+| `TARGET_ACTIVE_BACKENDS` | Integer | `3` | Number of local container processes to maintain active in Local Mode. |
+| `STARTUP_TIMEOUT` | Integer | `10` | Seconds to wait for a local container to boot and pass health checks. |
+| `MAX_RESTART_ATTEMPTS` | Integer | `3` | Maximum restart attempts allowed for a single container port. |
+| `HEALTH_CHECK_INTERVAL` | Integer | `3` | Delay (in seconds) between backend health probes (Clamped 1–60s). |
+
+---
+
+## 🖥️ Setting Up & Running Locally
 
 ### Build Requirements
-To compile the Load Balancer natively on your machine, you need:
-* A compiler supporting **C++20** (GCC 10+, Clang 12+, Xcode 13+)
-* **CMake** (v3.15 or higher)
-* Native system `pthread` runtime support
+To compile the project natively:
+* **Compiler**: Supporting **C++20** (GCC 10+, Clang 12+, Xcode 13+)
+* **Build System**: **CMake** (v3.15 or higher) and **Ninja**
+* **Library**: POSIX `pthreads` runtime support
 
 ### Building via CLI (CMake & Ninja)
-Navigate to the directory and run:
+Run the following commands in the workspace root:
 
 ```bash
-# Generate Ninja build artifacts in a dedicated debug directory
-cmake -S . -B cmake-build-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
+# Generate Ninja build artifacts in debug configuration
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
 
-# Compile the project 
-cmake --build cmake-build-debug
+# Compile the target binary
+cmake --build build
 
-# Run the compiled executable
-./cmake-build-debug/LOADbalancer
+# Run the executable
+./build/LOADbalancer
 ```
 
 ### Running in CLion IDE
 1. Open CLion and choose **Open**.
-2. Select the directory `/Users/rohansakhare/Desktop/LOADbalancer`.
-3. The IDE will automatically read the `CMakeLists.txt` file and load configuration profiles.
-4. To configure environment variables, edit the **Run Configuration** settings and populate:
-   * `LB_PORT=5649`
-   * `LB_ADMIN_PORT=5650`
-   * `BACKEND_PORTS=8080,8081,8082,8083,8084`
-   * `TARGET_ACTIVE_BACKENDS=3` *(Optional: number of local containers to keep active, default: 3)*
-   * `STARTUP_TIMEOUT=10` *(Optional: time in seconds to wait for a backend to startup, default: 10)*
-5. Press the green **Run** button or press `Ctrl + R`.
+2. Select the directory `/Users/rohansakhare/LOADbalancer`.
+3. Go to **Run/Debug Configurations** (`Run > Edit Configurations`).
+4. Select the `LOADbalancer` target.
+5. In the **Environment Variables** field, add your configuration:
+   ```env
+   LB_PORT=5649;LB_ADMIN_PORT=5650;BACKEND_PORTS=8080,8081,8082,8083,8084;TARGET_ACTIVE_BACKENDS=3;STARTUP_TIMEOUT=10
+   ```
+6. Press the green **Run** button.
 
 ---
 
-## 🐳 Docker Orchestrated Setup (5 Backend Nodes + DB + LB)
+## 🐳 Docker Orchestrated Setup (5 Backends + DB + LB)
 
-The system is configured to run as a 7-container stack managed via docker-compose.
+Running multiple servers locally on a host system can lead to dependency conflicts, local port clashes, and database link shortages. Running inside Docker Compose isolates these servers.
 
-### Directory Structure Expectation
-Your folders should be organized as follows for Docker to build both targets properly:
+### Directory Layout
+For the multi-container configuration to build correctly, verify your folders are arranged as follows:
 ```
-├── CardAPIServer/        # Backend server code (contains main parser&router file)
-└── LOADbalancer/         # Load balancer workspace containing docker-compose.yml
+├── CardAPIServer/        # Payment switching engine source files
+└── LOADbalancer/         # Load balancer directory containing docker-compose.yml
 ```
 
-### Troubleshooting the MySQL Connection Limit
-Running 5 backends simultaneously requires a higher MySQL connection limit:
-* Each C++ backend spawns an internal database connection pool of **30 sessions** (`POOL_SIZE = 30`).
-* **5 instances × 30 connections = 150 database connections.**
-* MySQL's default limit is **151** (`max_connections`).
-* If you run other client applications (like CLion Database Inspector or MySQL Workbench), the limit is instantly reached, causing the 4th and 5th backend containers to throw database connection errors at startup.
+### Database Capacity Configuration (Crucial)
+Each of the 5 C++ backend containers spins up an internal database connection pool of **30 sessions** (`POOL_SIZE = 30`).
+* $$5 \text{ backends} \times 30 \text{ connections} = 150 \text{ concurrent connections}$$
+* MySQL's default ceiling is **151** (`max_connections`).
+* If you run any other database tool (like CLion Database Inspector or MySQL Workbench), the connection limit is reached. The 4th and 5th backend containers will fail to connect at startup.
 
 #### **Solution**:
 Increase MySQL's connection limit by running this query on your MySQL server:
@@ -305,41 +398,46 @@ Increase MySQL's connection limit by running this query on your MySQL server:
 SET GLOBAL max_connections = 250;
 ```
 
-### Running the Docker Stack
-Run the orchestrator from the `LOADbalancer/` folder:
+### Starting the Docker Stack
+Run the commands from the `LOADbalancer/` directory:
 
 ```bash
-# Start and build the entire environment
-docker compose up --build
+# Build and run the environment in detached mode
+docker compose up --build -d
+
+# Verify that all 7 containers are healthy
+docker compose ps
 ```
 
-Docker Compose will perform these steps:
-1. Start the MySQL database container (`mysql-db`) and wait for it to pass its internal health checks.
-2. Spin up the 5 backend container servers (`card-backend-1` to `5`) and wait for their `/health` endpoints to respond with HTTP 200.
-3. Build the Load Balancer container (`card-lb`) and connect it to port `5649`.
+The startup order is:
+1. `mysql-db` boots and waits for its root health check to pass.
+2. `card-backend-1` to `5` boot and wait for `/health` to respond.
+3. `card-lb` compiles, starts on port `5649`, and begins routing.
 
 ---
 
 ## 📊 Monitoring & Administrative APIs
 
-The Load Balancer hosts an independent administrative HTTP server on port `5650`.
+The Load Balancer hosts an independent administrative server on port `5650`.
 
 ### GET `/lb/health`
-Checks the health of the load balancer itself.
+Verifies if the Load Balancer proxy is up.
 
-* **Request URL**: `http://localhost:5650/lb/health`
+* **Request**: `http://localhost:5650/lb/health`
 * **Response Status**: `200 OK`
 * **Response Body**:
-```json
-{
-    "status": "UP"
-}
-```
+  ```json
+  {
+     "status": "UP"
+  }
+  ```
 
-### GET `/lb/status`
-Exposes the real-time operational status, statistics, latency (EMA), active requests, and uptime for every backend node in the pool.
+---
 
-* **Request URL**: `http://localhost:5650/lb/status`
+### GET `/lb/status` (Metrics Console)
+Exposes the real-time operational status, statistics, latency (EMA), active requests, and uptime for every backend in the pool.
+
+* **Request**: `http://localhost:5650/lb/status`
 * **Response Status**: `200 OK`
 * **Response Body**:
 ```json
@@ -401,11 +499,12 @@ Exposes the real-time operational status, statistics, latency (EMA), active requ
 
 ---
 
-## ⚡ Simulating and Testing Load Balancing
+## ⚡ Load Simulation & Benchmarking
 
 You can verify that the load balancer correctly distributes requests across backends by running concurrent transactions.
 
-Using **ApacheBench (ab)**:
+To simulate transaction traffic under load using **ApacheBench (`ab`)**:
+
 ```bash
 ab -n 1000 -c 10 -p transaction.json -T application/json http://localhost:5649/transaction/initiate
 ```
@@ -418,25 +517,37 @@ Querying `/lb/status` while the benchmark is running will show `active_requests`
 ## 🔧 Troubleshooting Guide
 
 #### 1. Why does my POST request return `400 Bad Request` with an `"Empty request body"` error?
-This occurs if the load balancer intercepts requests inside `set_pre_routing_handler`. In `cpp-httplib`, the pre-routing handler runs *before* the server parses the HTTP body, meaning `req.body` is empty. 
-* **Fix**: Ensure your Load Balancer routes requests using explicit method handlers (e.g. `proxy_svr.Post(R"(.*)", ...)`) which run *after* the body has been fully buffered in memory.
+> [!WARNING]
+> This occurs if the load balancer intercepts requests inside `set_pre_routing_handler`. In `cpp-httplib`, the pre-routing handler runs *before* the server parses the HTTP body, meaning `req.body` is empty.
+> 
+> **Fix**: Ensure your Load Balancer routes requests using explicit method handlers (e.g. `proxy_svr.Post(R"(.*)", ...)`) which run *after* the body has been fully buffered in memory.
 
 #### 2. Why does Postman show a blank body but HTTP status `200 OK`?
-This happens when copying the backend response body to the frontend response (`res.body = result->body`) without using `res.set_content()`. Without a matching `Content-Type` header, clients (like Postman or web browsers) don't know how to render the response.
-* **Fix**: Always set the body and Content-Type together:
-  ```cpp
-  res.set_content(result->body, "application/json");
-  ```
+> [!IMPORTANT]
+> This happens when copying the backend response body to the frontend response (`res.body = result->body`) without calling `res.set_content()`. Without a matching `Content-Type` header, clients (like Postman or web browsers) don't know how to render the response.
+> 
+> **Fix**: Always set the body and Content-Type together:
+> ```cpp
+> res.set_content(result->body, "application/json");
+> ```
 
 #### 3. Why is there a 10-second delay when sending requests at startup?
-If backends default to `alive = true` before their health is verified, the Load Balancer may attempt to route traffic to offline servers. If a server is offline, the proxy client hits a connection timeout (5 seconds per attempt) before failing over to the next host, causing a noticeable delay.
-* **Fix**: Configure backends to start as `alive = false`. This ensures that they only receive traffic *after* passing 2 consecutive background health checks.
+> [!CAUTION]
+> If backends default to `alive = true` before their health is verified, the Load Balancer may attempt to route traffic to offline servers. If a server is offline, the proxy client hits a connection timeout (5 seconds per attempt) before failing over to the next host, causing a noticeable delay.
+> 
+> **Fix**: Configure backends to start as `alive = false`. This ensures that they only receive traffic *after* passing 2 consecutive background health checks.
+
+#### 4. Why are the 4th and 5th backend containers crashing in Docker Compose?
+> [!IMPORTANT]
+> This occurs when the total number of database sessions opened by the active backends exceeds the database server capacity threshold. 
+> 
+> **Fix**: Execute `SET GLOBAL max_connections = 250;` on the MySQL database instance to resolve connection exhaustion.
 
 ---
 
-## 👥 Author Information
+## 👥 Developer Contact Info
 
 * **Name**: Rohan Sakhare
 * **Email**: [rohanavinashsakhare@gmail.com](mailto:rohanavinashsakhare@gmail.com)
 * **Phone**: +91 9112765649
-* **GitHub Profile**: [@rohsak5649](https://github.com/rohsak5649)
+* **GitHub**: [@rohsak5649](https://github.com/rohsak5649)
