@@ -1,0 +1,42 @@
+name: C++ CI Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    name: Build Load Balancer (Ubuntu Release)
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Install Build Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake ninja-build
+
+    - name: Configure CMake
+      run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build Executable
+      run: cmake --build build --config Release
+
+    - name: Verify Binary Output
+      run: |
+        if [ ! -f build/LOADbalancer ]; then
+          echo "Error: Output binary build/LOADbalancer not found!"
+          exit 1
+        fi
+        echo "Binary successfully compiled:"
+        ls -lh build/LOADbalancer
+
+    - name: Upload Build Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: LOADbalancer-ubuntu-latest
+        path: build/LOADbalancer
